@@ -477,6 +477,18 @@ export function computePrecipitation(mesh, r_xyz, r_elevation, windResult, ocean
                 }
             }
 
+            // (i) Continental summer convective minimum
+            // BFS advection cannot model the diurnal convective cycle that brings
+            // afternoon thunderstorms to mid-latitude interiors in local summer.
+            // A modest floor prevents under-representation of semi-arid continental
+            // climates (BSk, Dfa) relative to their Köppen class.
+            if (isLand && inLocalSummer && cont > 0.3 && absLatDeg > 25 && absLatDeg < 58) {
+                const latFactor  = smoothstep(58, 38, absLatDeg) * smoothstep(25, 38, absLatDeg);
+                const contFactor = smoothstep(0.3, 0.75, cont);
+                const convFloor  = latFactor * contFactor * 0.13;
+                p = Math.max(p, convFloor);
+            }
+
             const precipMult = 1 + precipitationOffset * 0.5;
             let finalPrecip = p * precipMult;
             if (landCoverage > 0.4) {

@@ -246,7 +246,7 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, wind
         // Deep interiors tend to receive summer convective precipitation that the
         // BFS cap in precipitation.js underestimates; a small continental boost
         // prevents borderline-Dfa/Dsa cells from falling into BSk/BSh.
-        const contBoost = 1.0 + contVal * 0.28;
+        const contBoost = 1.0 + contVal * 0.75;
         const PannAdj = Pann * contBoost;
 
         if (PannAdj < Pthresh) {
