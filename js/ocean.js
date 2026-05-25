@@ -1,10 +1,13 @@
-// Ocean current simulation: rule-based geographic approach with wind-belt-driven gyres.
-// Wind belts drive zonal currents; continental shelves deflect them into gyres.
-// Warmth is classified geographically: western coasts = warm, eastern coasts = cold.
+// Ocean current simulation: wind-stress driven with Ekman-layer Coriolis deflection.
+// Surface drift = actual wind stress rotated 45° rightward (NH) / leftward (SH),
+// fading to wind-following at the equator where f → 0.
+// Western boundary intensification is approximated by redirecting westward-blocked
+// Ekman flow poleward along continental margins (Gulf Stream / Kuroshio mechanism).
+// Warmth is derived from the poleward component of the resulting current rather
+// than from hardcoded coast-type rules.
 
 console.log('[ocean.js] Module loaded');
-import { smoothstep } from './wind.js';
-import { makeItczLookup, percentile } from './climate-util.js';
+import { percentile } from './climate-util.js';
 
 const DEG = Math.PI / 180;
 
@@ -54,8 +57,6 @@ function computeCoastFields(mesh, r_xyz, r_isOcean,
         }
     }
 
-    // BFS: compute hop distance from seed set through ocean cells.
-    // Reuses a single queue array (capacity allocated once) across all three passes.
     const bfsQueue = new Int32Array(numRegions);
 
     function bfsDistance(seeds) {
@@ -82,7 +83,7 @@ function computeCoastFields(mesh, r_xyz, r_isOcean,
         return dist;
     }
 
-    const r_coastDist = bfsDistance(allCoastSeeds);
+    const r_coastDist     = bfsDistance(allCoastSeeds);
     const r_westCoastDist = bfsDistance(westSeeds);
     const r_eastCoastDist = bfsDistance(eastSeeds);
 
@@ -113,59 +114,6 @@ function hasCircumpolarChannel(r_lat, r_lon, r_isOcean, numRegions, targetLat, b
     return true;
 }
 
-// ── Geographic heat classification ──────────────────────────────────────────
-// Warmth is determined by coast type and wind cell. The prevailing wind
-// direction determines which side of a basin accumulates warm water:
-//   Hadley cell (trades westward):   western=warm, eastern=cold
-//   Ferrel cell (westerlies eastward): western=cold, eastern=warm  (flipped)
-//   Polar cell (easterlies westward):  western=warm, eastern=cold  (flipped back)
-
-function classifyWarmth(r_isOcean, r_lat, numRegions,
-    r_westCoastDist, r_eastCoastDist, fadeRange, seasonalShiftDeg) {
-    const r_warmth = new Float32Array(numRegions);
-
-    for (let r = 0; r < numRegions; r++) {
-        if (!r_isOcean[r]) continue;
-
-        // Shifted latitude for cell boundaries (matches wind band shift)
-        const bandLatDeg = Math.abs(r_lat[r] / DEG - seasonalShiftDeg);
-
-        // Wind cell sign: trades/polar push water west (western=warm → +1),
-        // westerlies push water east (western=cold → -1)
-        let cellSign;
-        if (bandLatDeg < 28) {
-            cellSign = 1;
-        } else if (bandLatDeg < 35) {
-            cellSign = 1 - 2 * smoothstep(28, 35, bandLatDeg);
-        } else if (bandLatDeg < 55) {
-            cellSign = -1;
-        } else if (bandLatDeg < 65) {
-            cellSign = -1 + 2 * smoothstep(55, 65, bandLatDeg);
-        } else {
-            cellSign = 1;
-        }
-
-        const wDist = r_westCoastDist[r];
-        const eDist = r_eastCoastDist[r];
-
-        let warm = 0;
-
-        if (wDist >= 0 && wDist < fadeRange) {
-            const t = 1 - wDist / fadeRange;
-            warm += cellSign * t * t;
-        }
-
-        if (eDist >= 0 && eDist < fadeRange) {
-            const t = 1 - eDist / fadeRange;
-            warm -= cellSign * t * t;
-        }
-
-        r_warmth[r] = Math.max(-1, Math.min(1, warm));
-    }
-
-    return r_warmth;
-}
-
 // ── Laplacian smoothing (ocean only) ────────────────────────────────────────
 
 function smoothOcean(mesh, field, r_isOcean, passes) {
@@ -194,15 +142,24 @@ function smoothOcean(mesh, field, r_isOcean, passes) {
 // ── Main entry point ────────────────────────────────────────────────────────
 
 /**
- * Compute ocean surface currents using rule-based geographic approach.
- * Wind belts drive zonal currents, continental shelves deflect them into
- * gyres. Warmth is classified geographically by coast type.
+ * Compute ocean surface currents from wind stress with Ekman-layer Coriolis deflection.
+ *
+ * Physical model (simplified for concept art):
+ *  1. Wind stress → Ekman surface drift: rotate wind vector 45° rightward (NH) /
+ *     leftward (SH).  Coriolis fades to zero at the equator (|lat| < 5°).
+ *  2. Western boundary intensification: westward Ekman drift blocked by a continental
+ *     margin is redirected poleward, approximating the geostrophic western boundary
+ *     current (Gulf Stream / Kuroshio / Brazil / Agulhas).
+ *  3. Eastern boundary cold current: eastward drift blocked by eastern coasts deflects
+ *     equatorward (California / Humboldt / Benguela / Canary).
+ *  4. Warmth from flow direction: poleward current = warm (advecting equatorial water),
+ *     equatorward = cold (advecting polar water).
  *
  * @param {SphereMesh} mesh
- * @param {Float32Array} r_xyz - per-region 3D positions
- * @param {Float32Array} r_elevation - per-region elevation
- * @param {object} windResult - output from computeWind() (includes lat, lon, sinLat, isLand, tangent frames, ITCZ arrays)
- * @returns {object} current vectors, warmth, and speed arrays for both seasons
+ * @param {Float32Array} r_xyz
+ * @param {Float32Array} r_elevation
+ * @param {object} windResult - output of computeWind()
+ * @returns {object} r_ocean_current_east/north, r_ocean_speed, r_ocean_warmth (summer + winter)
  */
 export function computeOceanCurrents(mesh, r_xyz, r_elevation, windResult) {
     console.log('[ocean.js] computeOceanCurrents called, numRegions:', mesh.numRegions);
@@ -211,14 +168,13 @@ export function computeOceanCurrents(mesh, r_xyz, r_elevation, windResult) {
     const timing = [];
 
     const { r_lat, r_sinLat, r_isLand,
-        r_eastX, r_eastY, r_eastZ,
-        r_northX, r_northY, r_northZ } = windResult;
+        r_eastX, r_eastY, r_eastZ } = windResult;
 
     // Ocean mask
     const r_isOcean = new Uint8Array(numRegions);
     for (let r = 0; r < numRegions; r++) r_isOcean[r] = r_isLand[r] ? 0 : 1;
 
-    // Step 0: Setup — r_lon and ITCZ lookups
+    // r_lon (may already be in windResult)
     let t0 = performance.now();
     let r_lon = windResult.r_lon;
     if (!r_lon) {
@@ -227,161 +183,165 @@ export function computeOceanCurrents(mesh, r_xyz, r_elevation, windResult) {
             r_lon[r] = Math.atan2(r_xyz[3 * r], r_xyz[3 * r + 2]);
         }
     }
+    timing.push({ stage: 'Ocean: setup', ms: performance.now() - t0 });
 
-    const itczLookupSummer = makeItczLookup(windResult.itczLons, windResult.itczLatsSummer);
-    const itczLookupWinter = makeItczLookup(windResult.itczLons, windResult.itczLatsWinter);
-    timing.push({ stage: 'Ocean: setup (ITCZ lookup + lon)', ms: performance.now() - t0 });
-
-    // Step 1: Coast distance & classification (shared between seasons)
+    // Step 1: Coast BFS (shared between seasons)
     t0 = performance.now();
     const { r_coastDist, r_westCoastDist, r_eastCoastDist } =
-        computeCoastFields(mesh, r_xyz, r_isOcean,
-            r_eastX, r_eastY, r_eastZ);
-    timing.push({ stage: 'Ocean: coast BFS (3 passes)', ms: performance.now() - t0 });
+        computeCoastFields(mesh, r_xyz, r_isOcean, r_eastX, r_eastY, r_eastZ);
+    timing.push({ stage: 'Ocean: coast BFS', ms: performance.now() - t0 });
 
     // Step 2: Circumpolar channel detection
     t0 = performance.now();
-    const circumpolarNH = hasCircumpolarChannel(r_lat, r_lon, r_isOcean, numRegions, 60 * DEG, 5 * DEG);
+    const circumpolarNH = hasCircumpolarChannel(r_lat, r_lon, r_isOcean, numRegions,  60 * DEG, 5 * DEG);
     const circumpolarSH = hasCircumpolarChannel(r_lat, r_lon, r_isOcean, numRegions, -60 * DEG, 5 * DEG);
     console.log(`[ocean.js] Circumpolar: NH=${circumpolarNH}, SH=${circumpolarSH}`);
-    timing.push({ stage: 'Ocean: circumpolar detection', ms: performance.now() - t0 });
+    timing.push({ stage: 'Ocean: circumpolar', ms: performance.now() - t0 });
 
-    // Coast influence threshold
-    const coastThreshold = Math.max(5, Math.round(Math.sqrt(numRegions) * 0.035));
-    // Warmth fade range — extends beyond coast deflection zone
-    const warmthRange = coastThreshold * 2;
+    // Boundary intensification radius (~750 km)
+    const coastThreshold = Math.max(5, Math.round(750 / avgEdgeKm));
+
+    // Per-cell Coriolis factor: 0 at equator, 1 at |lat| ≥ 5°.
+    // Prevents the 1/f divergence at the equator.
+    const sin5 = Math.sin(5 * DEG);
+    const r_coriolisFactor = new Float32Array(numRegions);
+    for (let r = 0; r < numRegions; r++) {
+        r_coriolisFactor[r] = Math.min(1, Math.abs(r_sinLat[r]) / sin5);
+    }
 
     const result = {};
-    const seasons = [
-        { name: 'summer', itczLookup: itczLookupSummer },
-        { name: 'winter', itczLookup: itczLookupWinter }
-    ];
 
-    for (const { name, itczLookup } of seasons) {
-        // Seasonal shift: wind cells migrate ~5° toward summer hemisphere
-        const seasonalShiftDeg = name === 'summer' ? 5 : -5;
+    for (const season of ['summer', 'winter']) {
+        const r_windE = windResult[`r_wind_east_${season}`];
+        const r_windN = windResult[`r_wind_north_${season}`];
 
-        // Steps 3–4: Wind band classification + current vectors
         t0 = performance.now();
         const currentE = new Float32Array(numRegions);
         const currentN = new Float32Array(numRegions);
 
+        // Step 3: Ekman surface drift
+        // Rotate wind vector by -(π/4)·sign(lat) (counterclockwise convention):
+        //   NH: −45° (clockwise) — rightward of wind direction
+        //   SH: +45° (counterclockwise) — leftward of wind direction
+        // At the equator the Coriolis factor fades to 0 → current follows wind directly.
+        //
+        // Rotation of (wE, wN) by angle α:
+        //   E' = wE·cos α − wN·sin α
+        //   N' = wE·sin α + wN·cos α
         for (let r = 0; r < numRegions; r++) {
             if (!r_isOcean[r]) continue;
 
-            const lat = r_lat[r];
-            const absLatDeg = Math.abs(lat) / DEG;
-            const lon = r_lon[r];
-            const hemisphereSign = lat >= 0 ? 1 : -1;
+            const sinLat = r_sinLat[r];
+            const cf     = r_coriolisFactor[r];
+            const alpha  = -(Math.PI / 4) * (sinLat >= 0 ? 1 : -1) * cf;
+            const cosA   = Math.cos(alpha);
+            const sinA   = Math.sin(alpha);
+            const wE     = r_windE[r];
+            const wN     = r_windN[r];
 
-            // Shifted latitude for wind band boundaries (cells migrate with season)
-            const bandLatDeg = Math.abs(lat / DEG - seasonalShiftDeg);
+            currentE[r] = wE * cosA - wN * sinA;
+            currentN[r] = wE * sinA + wN * cosA;
+        }
 
-            // ITCZ latitude at this longitude
-            const itczLat = itczLookup(lon);
-            const distFromItcz = Math.abs(lat - itczLat) / DEG;
+        // Step 4: Boundary intensification
+        // Western boundary (Gulf Stream / Kuroshio mechanism):
+        //   Trade winds drive westward Ekman drift → water piles against western coast →
+        //   geostrophic pressure gradient forces poleward jet (×2 intensification).
+        // Eastern boundary (California / Humboldt mechanism):
+        //   Westerlies drive eastward Ekman drift → blocked by eastern coast →
+        //   redirected equatorward as cold upwelling current.
+        for (let r = 0; r < numRegions; r++) {
+            if (!r_isOcean[r]) continue;
 
-            // Step 3: Base zonal flow from wind band (using shifted boundaries)
-            let baseE;
-            if (distFromItcz < 3) {
-                // ITCZ zone: eastward countercurrent at center, blends to westward at edges
-                baseE = 1 - 2 * smoothstep(0, 3, distFromItcz);
-            } else if (bandLatDeg < 30) {
-                // Trade winds: westward
-                baseE = -1;
-            } else if (bandLatDeg < 35) {
-                // Subtropical transition: blend trades → westerlies
-                baseE = -1 + 2 * smoothstep(30, 35, bandLatDeg);
-            } else if (bandLatDeg < 58) {
-                // Ferrel cell / westerlies: eastward
-                baseE = 1;
-            } else if (bandLatDeg < 65) {
-                // Subpolar transition: blend westerlies → polar easterlies
-                baseE = 1 - 1.5 * smoothstep(58, 65, bandLatDeg);
-            } else {
-                // Polar easterlies: weak westward
-                baseE = -0.5;
-            }
+            const sinLat  = r_sinLat[r];
+            const poleSign = sinLat >= 0 ? 1 : -1;
 
-            currentE[r] = baseE;
-            currentN[r] = 0;
-
-            // Step 4: Coast deflection
             const wDist = r_westCoastDist[r];
-            const eDist = r_eastCoastDist[r];
-
-            // Near western coast: strong poleward deflection (warm current)
             if (wDist >= 0 && wDist < coastThreshold) {
-                const t = 1 - wDist / coastThreshold;
-                const strength = t * t * 2.0; // western intensification ×2
-                currentN[r] += hemisphereSign * strength; // poleward
-                currentE[r] *= (1 - t * t * 0.7);
+                const prox = 1 - wDist / coastThreshold;
+                const prox2 = prox * prox;
+                // Westward Ekman component blocked by the coast
+                const blockedWest = Math.max(0, -currentE[r]);
+                currentN[r] += poleSign * blockedWest * prox2 * 2.0; // western intensification
+                currentE[r] *= 1 - prox2 * 0.7;
             }
 
-            // Near eastern coast: moderate equatorward deflection (cold current)
+            const eDist = r_eastCoastDist[r];
             if (eDist >= 0 && eDist < coastThreshold) {
-                const t = 1 - eDist / coastThreshold;
-                const strength = t * t * 0.8; // eastern weaker ×0.8
-                currentN[r] -= hemisphereSign * strength; // equatorward
-                currentE[r] *= (1 - t * t * 0.5);
+                const prox = 1 - eDist / coastThreshold;
+                const prox2 = prox * prox;
+                // Eastward Ekman component blocked by the coast
+                const blockedEast = Math.max(0, currentE[r]);
+                currentN[r] -= poleSign * blockedEast * prox2 * 0.8; // equatorward cold current
+                currentE[r] *= 1 - prox2 * 0.5;
             }
 
-            // Circumpolar override (55–75° with open channel)
-            const isCircumpolar = (lat > 0 && circumpolarNH) || (lat < 0 && circumpolarSH);
-            if (isCircumpolar && absLatDeg >= 55 && absLatDeg <= 75) {
-                const cStrength = 1 - Math.abs(absLatDeg - 65) / 10;
-                currentE[r] = currentE[r] * (1 - cStrength) + 1.5 * cStrength;
-                currentN[r] *= (1 - cStrength * 0.8);
+            // Circumpolar boost: open Southern/Arctic Ocean channels sustain
+            // a strong eastward circumpolar current driven by unimpeded westerlies.
+            const isCircumpolar = (sinLat > 0 && circumpolarNH) || (sinLat < 0 && circumpolarSH);
+            if (isCircumpolar) {
+                const absLatDeg = Math.abs(r_lat[r]) / DEG;
+                if (absLatDeg >= 55 && absLatDeg <= 75) {
+                    const cStr = 1 - Math.abs(absLatDeg - 65) / 10;
+                    currentE[r] = currentE[r] * (1 - cStr) + 1.5 * cStr;
+                    currentN[r] *= 1 - cStr * 0.8;
+                }
             }
         }
-        timing.push({ stage: `Ocean: wind bands + vectors (${name})`, ms: performance.now() - t0 });
+
+        timing.push({ stage: `Ocean: Ekman + boundary (${season})`, ms: performance.now() - t0 });
 
         // Step 5: Smooth ~125 km (scale-invariant)
         t0 = performance.now();
-        const oceanSmoothPasses = Math.max(2, Math.round(125 / avgEdgeKm));
-        smoothOcean(mesh, currentE, r_isOcean, oceanSmoothPasses);
-        smoothOcean(mesh, currentN, r_isOcean, oceanSmoothPasses);
-
-        // Zero out land
+        const smoothPasses = Math.max(2, Math.round(125 / avgEdgeKm));
+        smoothOcean(mesh, currentE, r_isOcean, smoothPasses);
+        smoothOcean(mesh, currentN, r_isOcean, smoothPasses);
         for (let r = 0; r < numRegions; r++) {
             if (!r_isOcean[r]) { currentE[r] = 0; currentN[r] = 0; }
         }
-        timing.push({ stage: `Ocean: smoothing (${name})`, ms: performance.now() - t0 });
+        timing.push({ stage: `Ocean: smooth current (${season})`, ms: performance.now() - t0 });
 
-        // Step 6: Geographic warmth classification (coast type, not flow direction)
-        // Smoothed heavily to blend out jagged coastline noise and dilute
-        // small island contributions (few coast cells → weak signal after smoothing).
+        // Step 6: Warmth from poleward component of current
+        // A current flowing toward the pole carries warm equatorial water (warm = +1).
+        // A current flowing toward the equator carries cold polar water (cold = −1).
         t0 = performance.now();
-        const r_warmth = classifyWarmth(r_isOcean, r_lat, numRegions,
-            r_westCoastDist, r_eastCoastDist, warmthRange, seasonalShiftDeg);
-        const warmthSmoothPasses = Math.max(3, Math.round(900 / avgEdgeKm));
-        smoothOcean(mesh, r_warmth, r_isOcean, warmthSmoothPasses);
+        const r_warmth = new Float32Array(numRegions);
+        for (let r = 0; r < numRegions; r++) {
+            if (!r_isOcean[r]) continue;
+            const sinLat   = r_sinLat[r];
+            const poleSign = sinLat >= 0 ? 1 : -1;
+            const poleward = currentN[r] * poleSign;
+            const spd      = Math.sqrt(currentE[r] * currentE[r] + currentN[r] * currentN[r]);
+            r_warmth[r]    = spd > 0.01 ? poleward / spd : 0;
+        }
+        // Smooth heavily — warmth signal should blur across basin scales (~900 km)
+        const warmthPasses = Math.max(3, Math.round(900 / avgEdgeKm));
+        smoothOcean(mesh, r_warmth, r_isOcean, warmthPasses);
+        timing.push({ stage: `Ocean: warmth (${season})`, ms: performance.now() - t0 });
 
-        // Step 7: Normalize speed (95th percentile)
-        // Use speed-squared to avoid sqrt in the hot loop; sqrt is monotonic
-        // so percentile on squared values gives the same ranking.
-        const r_speed = new Float32Array(numRegions);
-        const oceanSpeedsSq = new Float32Array(numRegions);
-        let oceanCount = 0;
+        // Step 7: Normalize speed to [0, 1] via 95th percentile
+        t0 = performance.now();
+        const r_speed    = new Float32Array(numRegions);
+        const speedsSq   = new Float32Array(numRegions);
+        let   oceanCount = 0;
         for (let r = 0; r < numRegions; r++) {
             const spdSq = currentE[r] * currentE[r] + currentN[r] * currentN[r];
             r_speed[r] = spdSq;
-            if (r_isOcean[r] && spdSq > 0) oceanSpeedsSq[oceanCount++] = spdSq;
+            if (r_isOcean[r] && spdSq > 0) speedsSq[oceanCount++] = spdSq;
         }
-        const p95Sq = percentile(oceanSpeedsSq.subarray(0, oceanCount), 0.95);
-        // Now convert to linear 0-1: speed/p95 = sqrt(spdSq)/sqrt(p95Sq) = sqrt(spdSq/p95Sq)
+        const p95Sq   = percentile(speedsSq.subarray(0, oceanCount), 0.95);
         const invP95Sq = 1 / p95Sq;
         for (let r = 0; r < numRegions; r++) {
             r_speed[r] = Math.min(1, Math.sqrt(r_speed[r] * invP95Sq));
         }
+        timing.push({ stage: `Ocean: normalize speed (${season})`, ms: performance.now() - t0 });
 
-        console.log(`[Ocean ${name}] coastThreshold=${coastThreshold}, warmthRange=${warmthRange}, p95Sq=${p95Sq.toExponential(3)}, oceanCells=${oceanCount}`);
-        timing.push({ stage: `Ocean: warmth + normalize (${name})`, ms: performance.now() - t0 });
+        console.log(`[Ocean ${season}] coastThreshold=${coastThreshold}, p95Sq=${p95Sq?.toExponential(3)}, oceanCells=${oceanCount}`);
 
-        result[`r_ocean_current_east_${name}`] = currentE;
-        result[`r_ocean_current_north_${name}`] = currentN;
-        result[`r_ocean_speed_${name}`] = r_speed;
-        result[`r_ocean_warmth_${name}`] = r_warmth;
+        result[`r_ocean_current_east_${season}`]  = currentE;
+        result[`r_ocean_current_north_${season}`] = currentN;
+        result[`r_ocean_speed_${season}`]         = r_speed;
+        result[`r_ocean_warmth_${season}`]        = r_warmth;
     }
 
     result._oceanTiming = timing;
