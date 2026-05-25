@@ -12,6 +12,14 @@
 // the LOCAL warm/cold season from temperature and use that to assign the
 // correct precipitation pattern (s/w/f).  Without this, Mediterranean (Cs)
 // and monsoon (Cw/Dw) climates are hemisphere-flipped.
+//
+// When windResult is supplied, three additional improvements activate:
+//   1. Direct latitude from r_lat (no hemisphere-guessing from temperature)
+//   2. windwardScore: dot(windDir, towardOcean) → relaxed 's' threshold on
+//      westerly windward coasts so Mediterranean (Cs) types appear correctly
+//   3. Continentality-aware aridity check: continental interiors receive a
+//      small precipitation boost before the Pthresh test, mirroring the
+//      FMG MIN_MOISTURE fix that unlocks Dfa/Dsa generation
 
 import { smoothstep } from './wind.js';
 
@@ -57,16 +65,16 @@ const CODE_TO_ID = {};
 KOPPEN_CLASSES.forEach((c, i) => { CODE_TO_ID[c.code] = i; });
 
 /**
- * Classify each region into a Köppen climate type using the worldbuilding-
- * pasta band-based methodology.
+ * Classify each region into a Köppen climate type.
  *
  * @param {object}       mesh         - SphereMesh
  * @param {Float32Array}  r_elevation  - per-region elevation (<=0 = ocean)
  * @param {object}        tempResult   - { r_temperature_summer, r_temperature_winter } (0-1 → -45..+45 C)
  * @param {object}        precipResult - { r_precip_summer, r_precip_winter } (0-1 p95-normalized)
+ * @param {object|null}   windResult   - optional; unlocks windwardScore, direct latitude, continentality
  * @returns {Uint8Array}  r_koppen     - per-region class ID (index into KOPPEN_CLASSES)
  */
-export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
+export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, windResult = null) {
     const n = mesh.numRegions;
     const r_koppen = new Uint8Array(n);
 
@@ -75,6 +83,50 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
     const pSummer = precipResult.r_precip_summer;
     const pWinter = precipResult.r_precip_winter;
 
+    // Optional geography/wind arrays from windResult
+    const r_lat           = windResult?.r_lat           ?? null;
+    const r_lon           = windResult?.r_lon           ?? null;
+    const r_continentality = windResult?.r_continentality ?? null;
+    const r_coastDist     = windResult?.r_coastDistLand  ?? null;
+    const wE_s            = windResult?.r_wind_east_summer  ?? null;
+    const wN_s            = windResult?.r_wind_north_summer ?? null;
+    const wE_w            = windResult?.r_wind_east_winter  ?? null;
+    const wN_w            = windResult?.r_wind_north_winter ?? null;
+    const { adjOffset, adjList } = mesh;
+
+    // ── Precompute per-cell toward-ocean direction in lat/lon tangent space ──
+    // Direction = toward the neighbor with the lowest r_coastDistLand (or toward
+    // ocean neighbors directly for coastal cells).  Used for windwardScore.
+    const r_coastDirE = new Float32Array(n);
+    const r_coastDirN = new Float32Array(n);
+    if (r_lat && r_lon && r_coastDist) {
+        for (let r = 0; r < n; r++) {
+            if (r_elevation[r] <= 0) continue;
+            const lat0 = r_lat[r], lon0 = r_lon[r];
+            const cosLat = Math.cos(lat0);
+            const myDist = r_coastDist[r];
+            let bE = 0, bN = 0, count = 0;
+            const end = adjOffset[r + 1];
+            for (let ni = adjOffset[r]; ni < end; ni++) {
+                const nb = adjList[ni];
+                const nbDist = r_elevation[nb] <= 0 ? -1 : r_coastDist[nb];
+                // Include ocean neighbors (dist=-1) and any land neighbor closer to coast
+                if (nbDist < myDist || (r_elevation[nb] <= 0)) {
+                    let dLon = r_lon[nb] - lon0;
+                    if (dLon >  Math.PI) dLon -= 2 * Math.PI;
+                    if (dLon < -Math.PI) dLon += 2 * Math.PI;
+                    const dLat = r_lat[nb] - lat0;
+                    bE += dLon * cosLat;
+                    bN += dLat;
+                    count++;
+                }
+            }
+            const len = Math.sqrt(bE * bE + bN * bN);
+            if (len > 1e-10) { r_coastDirE[r] = bE / len; r_coastDirN[r] = bN / len; }
+        }
+    }
+
+    // ── Per-cell classification ──
     for (let r = 0; r < n; r++) {
         // ── Ocean ──
         if (r_elevation[r] <= 0) {
@@ -83,103 +135,87 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
         }
 
         // ── Convert normalised values to physical units ──
-        // Ts/Tw are NH summer/winter proxies — NOT necessarily local warm/cold
         const Ts = -45 + Math.max(0, Math.min(1, tSummer[r])) * 90;
         const Tw = -45 + Math.max(0, Math.min(1, tWinter[r])) * 90;
-        const Thot  = Math.max(Ts, Tw);   // warmest month proxy (°C)
-        const Tcold = Math.min(Ts, Tw);    // coldest month proxy (°C)
+        const Thot  = Math.max(Ts, Tw);
+        const Tcold = Math.min(Ts, Tw);
         const Tann  = (Ts + Tw) / 2;
 
-        // "Shoulder-month" temperature: approximate the temp 2 months before
-        // peak summer.  With only 2 seasons we interpolate partway from peak
-        // toward cold.  The fraction 1.5/6 (vs the old 2/6) prevents extreme
-        // continental winters from dragging shoulder temps too low — in reality
-        // shoulder months track closer to the summer peak than to the annual
-        // mean when the swing is very asymmetric in duration.
+        // Shoulder-month temperature proxy (2 months before peak summer)
         const Tshoulder = Thot - (Thot - Tcold) * (1.2 / 6);
 
         // ── Hemisphere-aware local seasons ──
-        // Determine which simulation season is this cell's LOCAL warm season.
-        // NH cells: sim summer = local summer.  SH cells: sim winter = local summer.
         const localSummerIsSim = Ts >= Tw;
 
-        // Precipitation: each season value ∈ [0,1] represents ~6 months.
-        // Scale to approximate mm for that half-year.
-        const Ps = Math.max(0, pSummer[r]) * 1000;   // NH summer half-year mm
-        const Pw = Math.max(0, pWinter[r]) * 1000;    // NH winter half-year mm
-        const Pann = Ps + Pw;                          // annual mm
+        // Latitude: use r_lat directly when available (more accurate than
+        // inferring hemisphere from the temperature seasonal swing alone)
+        const latRad = r_lat ? r_lat[r] : (localSummerIsSim ? 1 : -1) * Math.abs(Math.asin(Math.max(-1, Math.min(1, Tann / 28))));
+        const absLat = Math.abs(latRad) * (180 / Math.PI);
 
-        // Local summer/winter precipitation (hemisphere-corrected)
+        // ── Precipitation in mm (p95-calibrated) ──
+        const Ps = Math.max(0, pSummer[r]) * 1000;
+        const Pw = Math.max(0, pWinter[r]) * 1000;
+        const Pann = Ps + Pw;
+
         const PsummerLocal = localSummerIsSim ? Ps : Pw;
         const PwinterLocal = localSummerIsSim ? Pw : Ps;
-        const PsMonthLocal = PsummerLocal / 6;   // avg monthly precip in local summer
-        const PwMonthLocal = PwinterLocal / 6;    // avg monthly precip in local winter
+        const PsMonthLocal = PsummerLocal / 6;
+        const PwMonthLocal = PwinterLocal / 6;
 
-        // Estimate driest individual month from the 6-month average.
-        // A 6-month dry-season average of 40mm might contain months ranging from
-        // 10mm to 70mm. The stronger the seasonal contrast (wet vs dry half-year),
-        // the more peaked the distribution within each half-year, so the driest
-        // month is further below the half-year average.
-        // Factor: at equal seasons (ratio=1) → driest ≈ 0.7× average
-        //         at strong monsoon (ratio=5+) → driest ≈ 0.35× average
+        // Estimate driest individual month from 6-month averages.
+        // At equal seasons (ratio=1) → driest ≈ 0.70× avg.
+        // At strong monsoon (ratio≥4) → driest ≈ 0.35× avg.
         const seasonRatio = Math.max(PsMonthLocal, PwMonthLocal) / (Math.min(PsMonthLocal, PwMonthLocal) || 1);
         const driestFraction = 0.60 - 0.35 * smoothstep(1, 4, seasonRatio);
         const Pdry = Math.min(PsMonthLocal, PwMonthLocal) * driestFraction;
 
+        // ── windwardScore (positive = ocean is upwind = windward coast) ──
+        // Uses annual-mean wind direction dotted against the toward-ocean vector,
+        // negated so that onshore wind gives a positive score (FMG convention).
+        let windwardScore = 0;
+        if (wE_s && wN_s && (r_coastDirE[r] !== 0 || r_coastDirN[r] !== 0)) {
+            const wE = (wE_s[r] + (wE_w ? wE_w[r] : wE_s[r])) * 0.5;
+            const wN = (wN_s[r] + (wN_w ? wN_w[r] : wN_s[r])) * 0.5;
+            const wLen = Math.sqrt(wE * wE + wN * wN) || 1;
+            // Negative of (windDir · towardOcean): positive when wind blows FROM ocean
+            windwardScore = Math.max(-1, Math.min(1,
+                -((wE / wLen) * r_coastDirE[r] + (wN / wLen) * r_coastDirN[r])
+            ));
+        }
+
+        // Continentality 0=coast, 1=deep interior
+        const contVal = r_continentality ? r_continentality[r] : 0;
+
         // ================================================================
         //  STEP 1 – TEMPERATURE BANDS
         // ================================================================
-        // Band codes: 'A' tropical, 'C' temperate, 'D' continental,
-        //             'ET' tundra, 'EF' ice cap
-        // Sub-bands for temperate: 'hotSummer' (>=22°C) vs 'coolSummer'
-        // Sub-bands for continental: 'humidCont' (Tshoulder>=10) vs 'subarctic'
 
         let band;
-        let tempSubBand = '';    // 'hotSummer'|'coolSummer' for C; 'humidCont'|'subarctic' for D
+        let tempSubBand = '';
 
         if (Thot < 0) {
-            // Ice cap: warmest month < 0°C
             band = 'EF';
         } else if (Thot < 10) {
-            // Tundra: warmest month 0-10°C
             band = 'ET';
         } else if (Tcold >= 18) {
-            // Tropical: coldest month >= 18°C
             band = 'A';
         } else if (Tcold >= 0) {
-            // Temperate: coldest month 0-18°C AND warmest >= 10°C
             band = 'C';
             tempSubBand = Thot >= 22 ? 'hotSummer' : 'coolSummer';
         } else {
-            // Continental: coldest month < 0°C AND warmest >= 10°C
             band = 'D';
             tempSubBand = Tshoulder >= 10 ? 'humidCont' : 'subarctic';
         }
 
-        // ── Short-circuit polar types ──
         if (band === 'EF') { r_koppen[r] = CODE_TO_ID['EF']; continue; }
         if (band === 'ET') { r_koppen[r] = CODE_TO_ID['ET']; continue; }
 
         // ================================================================
         //  STEP 2 – ARID ZONES (B)
         // ================================================================
-        // The blog approach: areas "dry in both seasons" become desert by
-        // default, with steppe as a transition on the edges.
-        //
-        // We use the standard Köppen aridity threshold (which encodes the
-        // idea of evapotranspiration exceeding precipitation) to decide B,
-        // then split desert vs steppe.
-        //
-        // h/k is determined by mean annual temperature (standard Köppen):
-        //   Tann >= 18°C → hot (h)
-        //   Tann <  18°C → cold (k)
-        //
-        // summerFrac uses LOCAL warm-season precipitation (hemisphere-corrected)
-        // because the threshold encodes evapotranspiration which peaks in
-        // the warm season regardless of hemisphere.
 
-        let Pthresh;
         const summerFrac = Pann > 0 ? PsummerLocal / Pann : 0.5;
+        let Pthresh;
         if (summerFrac >= 0.7) {
             Pthresh = 20 * Tann + 280;
         } else if (summerFrac <= 0.3) {
@@ -189,13 +225,18 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
         }
         Pthresh = Math.max(0, Pthresh);
 
-        if (Pann < Pthresh) {
-            const isHot = Tann >= 18;  // standard Köppen: h if mean annual temp >= 18°C
-            if (Pann < Pthresh * 0.5) {
-                // Desert
+        // Continental interior moisture boost — analog of FMG MIN_MOISTURE fix.
+        // Deep interiors tend to receive summer convective precipitation that the
+        // BFS cap in precipitation.js underestimates; a small continental boost
+        // prevents borderline-Dfa/Dsa cells from falling into BSk/BSh.
+        const contBoost = 1.0 + contVal * 0.28;
+        const PannAdj = Pann * contBoost;
+
+        if (PannAdj < Pthresh) {
+            const isHot = Tann >= 18;
+            if (PannAdj < Pthresh * 0.5) {
                 r_koppen[r] = isHot ? CODE_TO_ID['BWh'] : CODE_TO_ID['BWk'];
             } else {
-                // Steppe (transition fringe)
                 r_koppen[r] = isHot ? CODE_TO_ID['BSh'] : CODE_TO_ID['BSk'];
             }
             continue;
@@ -206,18 +247,21 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
         // ================================================================
 
         // ── Determine s / w / f precipitation pattern ──
-        // All comparisons use LOCAL summer/winter so the pattern is correct
-        // in both hemispheres.
-        // Our "monthly" values are 6-month averages, not individual months —
-        // this smooths the driest/wettest month contrast, so thresholds are
-        // relaxed vs. standard Köppen (which uses actual monthly extremes).
-        // s  = dry local summer:  summer month < 50mm AND < 1/2 winter month
-        // w  = dry local winter:  winter month < 1/4 summer month
-        //      (relaxed from standard 1/10 because 6-month averages compress contrast)
-        // f  = no dry season
-        let precipPattern;
+        //
+        // For 's' (dry local summer): relax the monthly threshold on windward
+        // westerly coasts (28–52° latitude, contVal < 0.35, windwardScore > 0.3).
+        // The subtropical high genuinely suppresses summer precipitation on these
+        // coasts; the physics-based simulation encodes this but the threshold can
+        // clip real Mediterranean patterns near the boundary.
         const localSummerDrier = PsummerLocal < PwinterLocal;
-        if (localSummerDrier && PsMonthLocal < 50 && PsMonthLocal < PwMonthLocal / 2) {
+        let sSummerThresh = 50; // mm/month (standard Köppen ≈ 40; relaxed for 6-month averages)
+        if (windwardScore > 0.3 && absLat > 28 && absLat < 52 && contVal < 0.35) {
+            // Up to 80 mm/month for strongly windward coasts at peak Mediterranean latitudes
+            sSummerThresh = 50 + windwardScore * 30 * smoothstep(28, 38, absLat) * smoothstep(52, 42, absLat);
+        }
+
+        let precipPattern;
+        if (localSummerDrier && PsMonthLocal < sSummerThresh && PsMonthLocal < PwMonthLocal / 2) {
             precipPattern = 's';
         } else if (!localSummerDrier && PwMonthLocal < PsMonthLocal / 3) {
             precipPattern = 'w';
@@ -225,11 +269,7 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
             precipPattern = 'f';
         }
 
-        // ── Determine temperature sub-letter (a / b / c / d) ──
-        // a: warmest month >= 22°C
-        // b: warmest < 22°C but 4+ months >= 10°C  (proxy: Tshoulder >= 10°C)
-        // c: fewer than 4 months >= 10°C, coldest >= −38°C
-        // d: coldest < −38°C  (extreme continental, only for D)
+        // ── Temperature sub-letter (a / b / c / d) ──
         let tempLetter;
         if (Thot >= 22) {
             tempLetter = 'a';
@@ -243,16 +283,6 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
 
         // ── Band A: Tropical ──
         if (band === 'A') {
-            // Blog approach:
-            //   very wet both seasons       → Af (tropical rainforest)
-            //   wet both seasons             → Am (tropical monsoon)
-            //   wet one season, dry other    → Aw (tropical savanna)
-            //
-            // Translated with thresholds:
-            //   Af: driest month >= 60 mm
-            //   Am: Pann >= 25*(100 - Pdry)  (i.e. enough total rain to sustain forest
-            //       despite a short dry spell)
-            //   Aw: everything else
             if (Pdry >= 60) {
                 r_koppen[r] = CODE_TO_ID['Af'];
             } else if (Pann >= 25 * (100 - Pdry)) {
@@ -265,10 +295,6 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
 
         // ── Band C: Temperate ──
         if (band === 'C') {
-            // Blog approach:
-            //   dry local summer → Mediterranean (Cs)
-            //   remaining hot-summer → humid subtropical (Cfa / Cwa)
-            //   remaining cool-summer → oceanic (Cfb / Cwb / Cfc / Cwc)
             const code = 'C' + precipPattern + tempLetter;
             const id = CODE_TO_ID[code];
             if (id !== undefined) {
@@ -281,12 +307,6 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult) {
 
         // ── Band D: Continental ──
         if (band === 'D') {
-            // Blog approach:
-            //   humid continental (Tshoulder >= 10°C) = Dfa/Dfb/Dsa/Dsb/Dwa/Dwb
-            //   subarctic (Tshoulder < 10°C) = Dfc/Dfd/Dsc/Dsd/Dwc/Dwd
-            //
-            // Ds zones appear near Mediterranean regions; Dw zones appear
-            // near regions with strong monsoon effect (far ITCZ excursion).
             const code = 'D' + precipPattern + tempLetter;
             const id = CODE_TO_ID[code];
             if (id !== undefined) {

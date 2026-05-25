@@ -314,7 +314,7 @@ function handleGenerate(data) {
             debugLayers.tempContinentality = tempResult.r_tempContinentality;
 
             t0 = performance.now();
-            debugLayers.koppen = classifyKoppen(mesh, r_elevation, tempResult, precipResult);
+            debugLayers.koppen = classifyKoppen(mesh, r_elevation, tempResult, precipResult, windResult);
             timing.push({ stage: 'Köppen classification', ms: performance.now() - t0 });
         }
 
@@ -487,7 +487,7 @@ function handleReapply(data) {
                 rainShadowWinter: precipResult.r_rainshadow_winter,
                 tempSummer: tempResult.r_temperature_summer,
                 tempWinter: tempResult.r_temperature_winter,
-                koppen: classifyKoppen(W.mesh, r_elevation, tempResult, precipResult)
+                koppen: classifyKoppen(W.mesh, r_elevation, tempResult, precipResult, windResult)
             } : null,
             _reapplyTiming: {
                 clone: tClone,
@@ -586,7 +586,7 @@ function handleEditRecompute(data) {
             debugLayers.tempWinter = tempResult.r_temperature_winter;
             debugLayers.tempContinentality = tempResult.r_tempContinentality;
 
-            debugLayers.koppen = classifyKoppen(mesh, r_elevation, tempResult, precipResult);
+            debugLayers.koppen = classifyKoppen(mesh, r_elevation, tempResult, precipResult, windResult);
 
             W.cachedWind = windResult;
             W.cachedOcean = oceanResult;
@@ -688,7 +688,7 @@ function handleComputeClimate(data) {
 
         progress(88, 'Classifying climates\u2026');
         t0 = performance.now();
-        const koppen = classifyKoppen(mesh, r_elevation_final, tempResult, precipResult);
+        const koppen = classifyKoppen(mesh, r_elevation_final, tempResult, precipResult, windResult);
         const tKoppen = performance.now() - t0;
 
         const tWorkerTotal = performance.now() - tTotal0;
@@ -943,7 +943,7 @@ function handleImportHeightmap(data) {
             debugLayers.tempContinentality = tempResult.r_tempContinentality;
 
             t0 = performance.now();
-            debugLayers.koppen = classifyKoppen(mesh, r_elevation, tempResult, precipResult);
+            debugLayers.koppen = classifyKoppen(mesh, r_elevation, tempResult, precipResult, windResult);
             timing.push({ stage: 'Köppen classification', ms: performance.now() - t0 });
         }
 

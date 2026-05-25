@@ -803,7 +803,7 @@ function generateFallback(overrideSeed, toggledIndices, onProgress, skipClimate)
                 debugLayers.tempSummer = tempResult.r_temperature_summer;
                 debugLayers.tempWinter = tempResult.r_temperature_winter;
                 debugLayers.tempContinentality = tempResult.r_tempContinentality;
-                debugLayers.koppen = classifyKoppen(ctx.mesh, r_elevation, tempResult, precipResult);
+                debugLayers.koppen = classifyKoppen(ctx.mesh, r_elevation, tempResult, precipResult, windResult);
             }
             const t_elevation = new Float32Array(ctx.mesh.numTriangles);
             for (let t = 0; t < ctx.mesh.numTriangles; t++) {
