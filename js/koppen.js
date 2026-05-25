@@ -22,6 +22,7 @@
 //      FMG MIN_MOISTURE fix that unlocks Dfa/Dsa generation
 
 import { smoothstep } from './wind.js';
+import { elevToHeightKm } from './color-map.js';
 
 /**
  * Köppen class definitions: ID → { code, name, color [r,g,b] 0-1 }.
@@ -141,15 +142,31 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, wind
         const Tcold = Math.min(Ts, Tw);
         const Tann  = (Ts + Tw) / 2;
 
+        // ── Highland swing reduction (port of FMG highland modifier) ──
+        // temperature.js already applies a lapse-rate reduction to the mean
+        // temperature, but does NOT reduce the seasonal swing.  In reality,
+        // thin-atmosphere highlands experience proportionally less seasonal
+        // swing: cold seasons aren't as deep and warm seasons cap out.
+        // Apply a modest narrowing above ~1.5 km so that highland tropics
+        // classify as Cwb/Cwc (subtropical highland) rather than Cwa.
+        const elevKm = elevToHeightKm(r_elevation[r]);
+        const highlandFactor = smoothstep(1.5, 4.5, elevKm);  // 0 at 1.5 km, 1 at 4.5 km
+        const swingNarrow = highlandFactor * (Thot - Tcold) * 0.22;
+        // Warm season cools slightly more; cold season warms slightly (thin atmosphere)
+        const ThhotEff  = Thot  - swingNarrow * 0.4;
+        const TcoldEff  = Tcold + swingNarrow * 0.6;
+        const TannEff   = (ThhotEff + TcoldEff) / 2;
+        const TshoulderEff = ThhotEff - (ThhotEff - TcoldEff) * (1.2 / 6);
+
         // Shoulder-month temperature proxy (2 months before peak summer)
-        const Tshoulder = Thot - (Thot - Tcold) * (1.2 / 6);
+        const Tshoulder = TshoulderEff;
 
         // ── Hemisphere-aware local seasons ──
         const localSummerIsSim = Ts >= Tw;
 
         // Latitude: use r_lat directly when available (more accurate than
         // inferring hemisphere from the temperature seasonal swing alone)
-        const latRad = r_lat ? r_lat[r] : (localSummerIsSim ? 1 : -1) * Math.abs(Math.asin(Math.max(-1, Math.min(1, Tann / 28))));
+        const latRad = r_lat ? r_lat[r] : (localSummerIsSim ? 1 : -1) * Math.abs(Math.asin(Math.max(-1, Math.min(1, TannEff / 28))));
         const absLat = Math.abs(latRad) * (180 / Math.PI);
 
         // ── Precipitation in mm (p95-calibrated) ──
@@ -193,15 +210,15 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, wind
         let band;
         let tempSubBand = '';
 
-        if (Thot < 0) {
+        if (ThhotEff < 0) {
             band = 'EF';
-        } else if (Thot < 10) {
+        } else if (ThhotEff < 10) {
             band = 'ET';
-        } else if (Tcold >= 18) {
+        } else if (TcoldEff >= 18) {
             band = 'A';
-        } else if (Tcold >= 0) {
+        } else if (TcoldEff >= 0) {
             band = 'C';
-            tempSubBand = Thot >= 22 ? 'hotSummer' : 'coolSummer';
+            tempSubBand = ThhotEff >= 22 ? 'hotSummer' : 'coolSummer';
         } else {
             band = 'D';
             tempSubBand = Tshoulder >= 10 ? 'humidCont' : 'subarctic';
@@ -217,11 +234,11 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, wind
         const summerFrac = Pann > 0 ? PsummerLocal / Pann : 0.5;
         let Pthresh;
         if (summerFrac >= 0.7) {
-            Pthresh = 20 * Tann + 280;
+            Pthresh = 20 * TannEff + 280;
         } else if (summerFrac <= 0.3) {
-            Pthresh = 20 * Tann;
+            Pthresh = 20 * TannEff;
         } else {
-            Pthresh = 20 * Tann + 140;
+            Pthresh = 20 * TannEff + 140;
         }
         Pthresh = Math.max(0, Pthresh);
 
@@ -233,7 +250,7 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, wind
         const PannAdj = Pann * contBoost;
 
         if (PannAdj < Pthresh) {
-            const isHot = Tann >= 18;
+            const isHot = TannEff >= 18;
             if (PannAdj < Pthresh * 0.5) {
                 r_koppen[r] = isHot ? CODE_TO_ID['BWh'] : CODE_TO_ID['BWk'];
             } else {
@@ -271,11 +288,11 @@ export function classifyKoppen(mesh, r_elevation, tempResult, precipResult, wind
 
         // ── Temperature sub-letter (a / b / c / d) ──
         let tempLetter;
-        if (Thot >= 22) {
+        if (ThhotEff >= 22) {
             tempLetter = 'a';
         } else if (Tshoulder >= 10) {
             tempLetter = 'b';
-        } else if (Tcold >= -38) {
+        } else if (TcoldEff >= -38) {
             tempLetter = 'c';
         } else {
             tempLetter = 'd';
